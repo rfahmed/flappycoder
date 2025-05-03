@@ -1,0 +1,12 @@
+[package]
+name = "flappy-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+async-channel = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+flappy-llm = { path = "../flappy-llm" } 

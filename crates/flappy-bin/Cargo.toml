@@ -1,0 +1,16 @@
+[package]
+name = "flappy-bin"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+openai = ["flappy-llm/openai"]
+
+[dependencies]
+flappy-core = { path = "../flappy-core" }
+flappy-tui = { path = "../flappy-tui" }
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { workspace = true }
+flappy-llm = { path = "../flappy-llm" } 

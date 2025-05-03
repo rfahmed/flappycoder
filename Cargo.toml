@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flappy-bin",
+    "crates/flappy-core",
+    "crates/flappy-tui",
+    "crates/flappy-llm",
+]
+
+[workspace.dependencies]
+ratatui = "0.24"
+crossterm = "0.27"
+tokio = { version = "1.37", features = ["full"] }
+async-channel = "2.2"
+anyhow = "1.0"
+thiserror = "1.0"
+futures-core = "0.3"
+async-trait = "0.1"
+futures-util = "0.3" 

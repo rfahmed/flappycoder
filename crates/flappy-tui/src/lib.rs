@@ -2,12 +2,13 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use flappy_core::{App, UiEvent, Role, Focus};
+use flappy_core::{App, UiEvent, Role, Focus, ChatLogItem};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Color, Modifier};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Table, Row, Cell, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Table, Row, Cell, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::prelude::Margin;
 use ratatui::Terminal;
 use std::io::{stdout, Result as IoResult};
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ pub async fn run(mut app: App) -> Result<()> {
 
     let res = ui_loop(&mut terminal, &mut app).await;
 
-    restore_terminal()?;
+    // Restore terminal state passed into restore_terminal
+    restore_terminal(&mut terminal)?;
 
     if let Err(e) = res {
         eprintln!("Error: {e}");
@@ -34,7 +36,8 @@ fn setup_terminal() -> IoResult<()> {
     Ok(())
 }
 
-fn restore_terminal() -> IoResult<()> {
+// Restore terminal state - needs the terminal instance
+fn restore_terminal<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> IoResult<()> {
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -57,23 +60,21 @@ async fn ui_loop<B: ratatui::backend::Backend>(
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
     let mut input_buf = String::new();
+    let mut last_model_area_height: u16 = 3; // Store the height calculated in the last draw pass
 
     loop {
         // Drain UI events (from LLM stream)
         while let Ok(UiEvent::Token(role, tok)) = app.rx_ui.try_recv() {
-            if let Some((last_role, ref mut txt)) = app.messages.last_mut() {
-                if *last_role == role {
+            // Find the last message item and append, or add a new one
+            match app.messages.last_mut() {
+                Some(ChatLogItem::Message(last_role, ref mut txt)) if *last_role == role => {
+                    // Append to existing message of the same role
                     txt.push_str(&tok);
-                } else {
-                    app.messages.push((role, tok));
+                },
+                _ => {
+                    // Add new message item
+                    app.messages.push(ChatLogItem::Message(role, tok));
                 }
-            } else {
-                app.messages.push((role, tok));
-            }
-            // Scroll chat to bottom when new message arrives
-            let num_lines = app.messages.len();
-            if num_lines > 0 {
-                 app.chat_scroll = (num_lines - 1).try_into().unwrap_or(0);
             }
         }
 
@@ -89,12 +90,13 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                 }
             };
 
-            // Three-pane vertical layout
+            // Three-pane vertical layout - Model pane always height 3 (or more when focused)
+            let model_area_height = if app.focus == Focus::Model { 11 } else { 3 };
             let vchunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1), // Chat Area
-                    if app.selector_open { Constraint::Length(11) } else { Constraint::Length(0) }, // Model Selector (collapsible)
+                    Constraint::Length(model_area_height),
                     Constraint::Length(3), // Input Area
                 ])
                 .split(size);
@@ -102,22 +104,249 @@ async fn ui_loop<B: ratatui::backend::Backend>(
             let model_area = vchunks[1];
             let input_area = vchunks[2];
 
+            // Update the stored height for use in event handling below
+            last_model_area_height = model_area.height;
+
             // Render Chat Pane
-            let lines: Vec<Line> = app.messages.iter().map(|(role, msg)| {
-                let prefix = match role {
-                    Role::User => "You: ",
-                    Role::Assistant => "AI: ",
+            let lines: Vec<Line> = app.messages.iter().enumerate().map(|(index, item)| {
+                let is_selected = app.focus == Focus::Chat && app.selected_message_index == Some(index);
+                let line_style = if is_selected {
+                    Style::default().bg(Color::DarkGray) // Light box highlight
+                } else {
+                    Style::default()
                 };
-                Line::from(vec![Span::styled(prefix, Style::default().fg(Color::Yellow)), Span::raw(msg)])
-            }).collect();
+
+                match item {
+                    ChatLogItem::Message(role, msg) => {
+                        let prefix = match role {
+                            Role::User => "You: ",
+                            Role::Assistant => "AI: ",
+                        };
+
+                        if app.editing && app.selected_message_index == Some(index) {
+                            // We're editing this message - show the edit buffer with cursor
+                            let mut spans = Vec::new();
+                            spans.push(Span::styled(prefix, Style::default().fg(Color::Yellow)));
+
+                            // Only compute diff for non-empty content
+                            if !app.edit_buffer.is_empty() || !app.original_text.is_empty() {
+                                // Compute visual diff between original and edited text
+                                let diff_segments = compute_diff(&app.original_text, &app.edit_buffer);
+                                
+                                // Count additions and deletions for badge
+                                let mut add_cnt = 0;
+                                let mut del_cnt = 0;
+                                for (seg, is_del, is_add) in &diff_segments {
+                                    if *is_add { add_cnt += seg.chars().count(); }
+                                    if *is_del { del_cnt += seg.chars().count(); }
+                                }
+                                // Build badge spans
+                                let mut badge_spans = Vec::new();
+                                if add_cnt > 0 {
+                                    badge_spans.push(Span::styled(format!("+{}", add_cnt), Style::default().fg(Color::Green)));
+                                    badge_spans.push(Span::raw(" "));
+                                }
+                                if del_cnt > 0 {
+                                    badge_spans.push(Span::styled(format!("-{}", del_cnt), Style::default().fg(Color::Red)));
+                                    badge_spans.push(Span::raw(" "));
+                                }
+                                spans.extend(badge_spans);
+                                
+                                let mut cursor_shown = false;
+                                let mut current_pos = prefix.len();
+
+                                for (segment, is_deletion, is_addition) in diff_segments {
+                                    let style = match (is_deletion, is_addition) {
+                                        (true, false) => Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                                        (false, true) => Style::default().fg(Color::Green),
+                                        _ => Style::default(),
+                                    };
+
+                                    // Add cursor in the right place if editing
+                                    if !cursor_shown && current_pos + segment.len() >= app.edit_cursor + prefix.len() {
+                                        // Figure out cursor position within this segment
+                                        let cursor_offset = app.edit_cursor + prefix.len() - current_pos;
+                                        
+                                        // Split the segment at cursor position and add cursor style
+                                        if cursor_offset < segment.len() {
+                                            let (before, after) = segment.split_at(cursor_offset);
+                                            spans.push(Span::styled(before.to_string(), style));
+                                            
+                                            // Add cursor - render as inverted character or a visible symbol
+                                            let cursor_char = after.chars().next().unwrap_or(' ');
+                                            spans.push(Span::styled(
+                                                cursor_char.to_string(),
+                                                Style::default().fg(Color::Black).bg(Color::Green)
+                                            ));
+                                            
+                                            // Rest of segment after cursor
+                                            if after.len() > 1 {
+                                                spans.push(Span::styled(after[1..].to_string(), style));
+                                            }
+                                            
+                                            cursor_shown = true;
+                                        } else {
+                                            spans.push(Span::styled(segment.clone(), style));
+                                        }
+                                    } else {
+                                        spans.push(Span::styled(segment.clone(), style));
+                                    }
+                                    
+                                    current_pos += segment.len();
+                                }
+                                
+                                // If cursor is at the end of text, add it as a visible character
+                                if !cursor_shown {
+                                    spans.push(Span::styled("█", Style::default()));
+                                }
+                            } else {
+                                // Empty content, just show a cursor
+                                spans.push(Span::styled("█", Style::default()));
+                            }
+                            
+                            vec![Line::from(spans)]
+                        } else if is_selected {
+                            // Selected message but not being edited - show with highlight
+                            vec![Line::from(vec![Span::styled(
+                                format!("{}{}", prefix, msg),
+                                line_style,
+                            )])]
+                        } else {
+                            // Regular message display
+                            vec![Line::from(vec![
+                                Span::styled(prefix, Style::default().fg(Color::Yellow)),
+                                Span::raw(msg),
+                            ])]
+                        }
+                    },
+                    ChatLogItem::ModelSwitch(model_name) => {
+                        // Build the separator text
+                        let sep = format!("--- Switched to New Model: {} ---", model_name);
+                        if is_selected {
+                            vec![
+                                Line::raw(""),
+                                Line::from(vec![Span::styled(sep, line_style)]).alignment(ratatui::layout::Alignment::Center),
+                                Line::raw(""),
+                            ]
+                        } else {
+                            vec![
+                                Line::raw(""),
+                                Line::from(vec![Span::styled(
+                                    sep,
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+                                )]).alignment(ratatui::layout::Alignment::Center),
+                                Line::raw(""),
+                            ]
+                        }
+                    },
+                    ChatLogItem::InitialModel(msg) => {
+                        if is_selected {
+                            vec![
+                                Line::raw(""),
+                                Line::from(vec![Span::styled(
+                                    msg.clone(),
+                                    line_style,
+                                )]).alignment(ratatui::layout::Alignment::Center),
+                                Line::raw(""),
+                            ]
+                        } else {
+                            vec![
+                                Line::raw(""),
+                                Line::from(vec![Span::styled(
+                                    msg.clone(),
+                                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                                )]).alignment(ratatui::layout::Alignment::Center),
+                                Line::raw(""),
+                            ]
+                        }
+                    },
+                    ChatLogItem::EditedMessage(role, msg, add_cnt, del_cnt) => {
+                        let prefix = match role {
+                            Role::User => "You: ",
+                            Role::Assistant => "AI: ",
+                        };
+                        let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::Yellow))];
+                        if *add_cnt > 0 {
+                            spans.push(Span::styled(format!("+{}", add_cnt), Style::default().fg(Color::Green)));
+                            spans.push(Span::raw(" "));
+                        }
+                        if *del_cnt > 0 {
+                            spans.push(Span::styled(format!("-{}", del_cnt), Style::default().fg(Color::Red)));
+                            spans.push(Span::raw(" "));
+                        }
+                        spans.push(Span::raw(msg));
+                        vec![Line::from(spans)]
+                    }
+                }
+            }).flatten() // Flatten the Vec<Vec<Line>> into Vec<Line>
+              .collect();
+            let chat_height = chat_area.height.saturating_sub(2); // Account for borders
+            let num_lines = lines.len();
+            let max_scroll = num_lines.saturating_sub(chat_height as usize).try_into().unwrap_or(0);
+            app.chat_scroll = app.chat_scroll.min(max_scroll); // Clamp scroll on resize
+            
+            // Auto-scroll to ensure selected/edited message is visible
+            if let Some(selected_idx) = app.selected_message_index {
+                // First, find out which line in the flattened lines array contains our selected message
+                let mut line_count = 0;
+                let mut selected_line = 0;
+                
+                for (idx, _) in app.messages.iter().enumerate() {
+                    if idx == selected_idx {
+                        selected_line = line_count;
+                        break;
+                    }
+                    // Add the number of lines this message takes (accounting for ModelSwitch/InitialModel padding)
+                    match &app.messages[idx] {
+                        ChatLogItem::Message(_, _) | ChatLogItem::EditedMessage(_, _, _, _) => line_count += 1,
+                        ChatLogItem::ModelSwitch(_) | ChatLogItem::InitialModel(_) => line_count += 3,
+                    }
+                }
+                
+                // Compute visible start and end lines based on current scroll position
+                let visible_start = app.chat_scroll as usize;
+                let visible_end = visible_start + chat_height as usize;
+                
+                // Adjust scroll position if selected item is outside visible range
+                if selected_line < visible_start {
+                    // Scroll up to show selected line (with some context)
+                    app.chat_scroll = selected_line.saturating_sub(1) as u16;
+                } else if selected_line >= visible_end {
+                    // Scroll down to show selected line (with some context)
+                    app.chat_scroll = (selected_line - chat_height as usize + 2) as u16;
+                    app.chat_scroll = app.chat_scroll.min(max_scroll); // Ensure we don't scroll past the end
+                }
+            }
+            
             let chat = Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL).title("Chat").border_style(border_style(Focus::Chat)))
                 .wrap(Wrap { trim: true })
                 .scroll((app.chat_scroll, 0));
-            f.render_widget(chat, chat_area);
+            
+            // Draw the chat with scrollbar
+            f.render_widget(chat.clone(), chat_area);
+            
+            // Draw scrollbar if needed
+            if max_scroll > 0 {
+                let scrollbar = Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓"));
+                
+                let scrollbar_state = ScrollbarState::default()
+                    .position(app.chat_scroll as usize)
+                    .content_length(num_lines);
+                
+                f.render_stateful_widget(
+                    scrollbar,
+                    chat_area.inner(&Margin { vertical: 1, horizontal: 0 }),
+                    &mut scrollbar_state.clone(),
+                );
+            }
 
-            // Render Model Selector Pane (if open)
-            if app.selector_open {
+            // Render Model Pane (Selector or Current Model)
+            if app.focus == Focus::Model {
+                // Render Full Selector Table when focused
                 let max_visible_items = (model_area.height as usize).saturating_sub(4); // Header + borders
                 if menu_selected >= menu_offset + max_visible_items {
                     menu_offset = menu_selected.saturating_sub(max_visible_items.saturating_sub(1));
@@ -127,12 +356,23 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                 let visible_models = models.iter().skip(menu_offset).take(max_visible_items);
                 let rows = visible_models.enumerate().map(|(visible_idx, m)| {
                     let global_idx = visible_idx + menu_offset;
-                    let style = if global_idx == menu_selected {
+                    let is_selected = global_idx == menu_selected;
+                    let is_current = m == &app.model;
+
+                    let display_text = if is_current {
+                        format!("{} (current)", m)
+                    } else {
+                        m.clone()
+                    };
+
+                    let style = if is_selected {
                         Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else if is_current {
+                        Style::default().fg(Color::Green) // Highlight current model differently if not selected
                     } else {
                         Style::reset() // Transparent background
                     };
-                    Row::new(vec![Cell::from(m.clone())]).style(style)
+                    Row::new(vec![Cell::from(display_text)]).style(style)
                 });
                 let header_cells = ["Available Models"].iter().map(|h| Cell::from(*h));
                 let header = Row::new(header_cells).style(Style::default().fg(Color::Yellow)).height(1).bottom_margin(1);
@@ -145,6 +385,13 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                     .highlight_symbol(">> ")
                     .widths(&[Constraint::Percentage(100)]);
                 f.render_widget(table, model_area);
+            } else {
+                // Render Just Current Model when not focused
+                let model_text = format!("Model: {}", app.model);
+                let paragraph = Paragraph::new(model_text)
+                    .block(Block::default().borders(Borders::ALL).title("Model").border_style(border_style(Focus::Model)))
+                    .alignment(ratatui::layout::Alignment::Center); // Center the model name
+                 f.render_widget(paragraph, model_area);
             }
 
             // Render Input Pane
@@ -184,10 +431,18 @@ async fn ui_loop<B: ratatui::backend::Backend>(
 
         if crossterm::event::poll(tick_rate)? {
             if let CEvent::Key(key) = event::read()? {
-                let old_focus = app.focus; // Track focus changes
-
                 match (app.focus, key.code, key.modifiers) {
-                    // --- Global Quit --- 
+                    // --- Specific Esc for Model Pane (must come before global Esc) --- 
+                    (Focus::Model, KeyCode::Esc, _) => {
+                        app.focus = Focus::Input; // Go back to input field
+                        quit_pending = false; // Ensure quit is not triggered
+                    }
+                    // Edit mode - Cancel editing
+                    (Focus::Chat, KeyCode::Esc, _) if app.editing => {
+                        app.cancel_edit();
+                        quit_pending = false;
+                    }
+                    // --- Global Quit (now after specific Esc handlers) --- 
                     (_, KeyCode::Esc, _) => {
                         if quit_pending {
                             return Ok(()); // Quit
@@ -215,12 +470,74 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                     }
                     // --- Chat Pane --- 
                     (Focus::Chat, KeyCode::Up | KeyCode::Char('k'), _) => {
-                        app.chat_scroll = app.chat_scroll.saturating_sub(if key.modifiers == KeyModifiers::SHIFT { 5 } else { 1 });
+                        if app.editing {
+                            // Do nothing while editing
+                        } else {
+                            let num_messages = app.messages.len();
+                            if num_messages > 0 {
+                                let current_index = app.selected_message_index.unwrap_or(0); // Default to top if none selected
+                                let next_index = if current_index == 0 {
+                                    // Optional: Wrap around to bottom? Or just stay at 0?
+                                    // Let's stay at 0 for now.
+                                    0
+                                } else {
+                                    current_index.saturating_sub(1)
+                                };
+                                app.selected_message_index = Some(next_index);
+                                // TODO: Adjust scroll to keep selected item visible
+                            }
+                        }
                         quit_pending = false;
                     }
                     (Focus::Chat, KeyCode::Down | KeyCode::Char('j'), _) => {
-                        let max_scroll = app.messages.len().saturating_sub(1) as u16; // Adjust based on visible lines
-                        app.chat_scroll = app.chat_scroll.saturating_add(if key.modifiers == KeyModifiers::SHIFT { 5 } else { 1 }).min(max_scroll);
+                        if app.editing {
+                            // Do nothing while editing
+                        } else {
+                            let num_messages = app.messages.len();
+                            if num_messages > 0 {
+                                let current_index = app.selected_message_index.unwrap_or(num_messages -1); // Default to bottom if none selected
+                                let next_index = if current_index >= num_messages - 1 {
+                                    // Optional: Wrap around to top? Or stay at bottom?
+                                    // Let's stay at bottom for now.
+                                    num_messages - 1
+                                } else {
+                                    current_index.saturating_add(1)
+                                };
+                                app.selected_message_index = Some(next_index);
+                                // TODO: Adjust scroll to keep selected item visible
+                            }
+                        }
+                        quit_pending = false;
+                    }
+                    // Edit mode - Enter key starts editing a selected message
+                    (Focus::Chat, KeyCode::Enter, _) if !app.editing => {
+                        // Try to start editing the selected message
+                        app.start_editing();
+                        quit_pending = false;
+                    }
+                    // Edit mode - Accept changes
+                    (Focus::Chat, KeyCode::Enter, _) if app.editing => {
+                        app.commit_edit();
+                        quit_pending = false;
+                    }
+                    // Edit mode - Character input
+                    (Focus::Chat, KeyCode::Char(c), _) if app.editing => {
+                        app.insert_char(c);
+                        quit_pending = false;
+                    }
+                    // Edit mode - Backspace
+                    (Focus::Chat, KeyCode::Backspace, _) if app.editing => {
+                        app.delete_char();
+                        quit_pending = false;
+                    }
+                    // Edit mode - Left arrow
+                    (Focus::Chat, KeyCode::Left, _) if app.editing => {
+                        app.cursor_left();
+                        quit_pending = false;
+                    }
+                    // Edit mode - Right arrow
+                    (Focus::Chat, KeyCode::Right, _) if app.editing => {
+                        app.cursor_right();
                         quit_pending = false;
                     }
                     // --- Model Selector Pane --- 
@@ -239,14 +556,14 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                         quit_pending = false;
                     }
                     (Focus::Model, KeyCode::PageUp, _) => {
-                       let page_size = model_area.height.saturating_sub(4) as usize;
-                       menu_selected = menu_selected.saturating_sub(page_size);
-                       quit_pending = false;
+                        let page_size = last_model_area_height.saturating_sub(4) as usize; // Use height from last draw
+                        menu_selected = menu_selected.saturating_sub(page_size);
+                        quit_pending = false;
                     }
                     (Focus::Model, KeyCode::PageDown, _) => {
-                       let page_size = model_area.height.saturating_sub(4) as usize;
-                       menu_selected = (menu_selected + page_size).min(models.len() - 1);
-                       quit_pending = false;
+                        let page_size = last_model_area_height.saturating_sub(4) as usize; // Use height from last draw
+                        menu_selected = (menu_selected + page_size).min(models.len() - 1);
+                        quit_pending = false;
                     }
                     (Focus::Model, KeyCode::Home, _) => { 
                        menu_selected = 0; 
@@ -257,9 +574,15 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                        quit_pending = false;
                     }
                     (Focus::Model, KeyCode::Enter, _) => {
-                        app.model = models[menu_selected].clone();
-                        app.selector_open = false; // Close selector on selection
-                        app.focus = Focus::Input;  // Move focus to input after selection
+                        let new_model = models[menu_selected].clone();
+                        let old_model = app.model.clone();
+                        // Only add event and update if the model actually changed
+                        if new_model != old_model {
+                            // Add the switch event *before* changing the model in the app state
+                            app.messages.push(ChatLogItem::ModelSwitch(new_model.clone()));
+                            app.model = new_model; // Update the app's current model
+                        }
+                        app.focus = Focus::Input;  // Always move focus to input after selection/confirmation
                         quit_pending = false;
                     }
                     // --- Input Pane --- 
@@ -275,7 +598,7 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                         if !input_buf.trim().is_empty() {
                             let msg = input_buf.clone();
                             input_buf.clear();
-                            app.messages.push((Role::User, msg.clone()));
+                            app.messages.push(ChatLogItem::Message(Role::User, msg.clone()));
                             let mut app_clone = app.clone();
                             tokio::spawn(async move {
                                 let _ = app_clone.handle_user_msg(msg).await;
@@ -285,13 +608,6 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                     }
                     // --- Catch-all for other keys --- 
                     _ => { quit_pending = false; } // Any other key cancels quit prompt
-                }
-
-                // Toggle selector pane visibility based on focus change
-                if old_focus != Focus::Model && app.focus == Focus::Model {
-                    app.selector_open = true;
-                } else if old_focus == Focus::Model && app.focus != Focus::Model {
-                    app.selector_open = false;
                 }
             }
         }
@@ -311,6 +627,91 @@ async fn ui_loop<B: ratatui::backend::Backend>(
         }
     }
 
-    // Should return IoResult based on original code
-    Ok(())
+    // Loop only exits via return Ok(()) on Esc, so this is unreachable
+}
+
+// Replace the entire compute_diff function with a new implementation
+// ... existing code ...
+fn compute_diff(original: &str, edited: &str) -> Vec<(String, bool, bool)> {
+    if original == edited {
+        return vec![(edited.to_string(), false, false)];
+    }
+
+    // Tokenize into words + whitespace tokens
+    fn tokenize(s: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut last_is_space = None;
+        for ch in s.chars() {
+            let is_space = ch.is_whitespace();
+            match last_is_space {
+                Some(state) if state == is_space => {
+                    current.push(ch);
+                }
+                Some(_) => {
+                    tokens.push(current.clone());
+                    current.clear();
+                    current.push(ch);
+                }
+                None => {
+                    current.push(ch);
+                }
+            }
+            last_is_space = Some(is_space);
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    let a = tokenize(original);
+    let b = tokenize(edited);
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            if a[i] == b[j] {
+                dp[i][j] = dp[i + 1][j + 1] + 1;
+            } else {
+                dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
+            }
+        }
+    }
+
+    let mut i = 0;
+    let mut j = 0;
+    let mut result = Vec::new();
+    while i < n && j < m {
+        if a[i] == b[j] {
+            result.push((a[i].clone(), false, false));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            result.push((a[i].clone(), true, false));
+            i += 1;
+        } else {
+            result.push((b[j].clone(), false, true));
+            j += 1;
+        }
+    }
+    while i < n {
+        result.push((a[i].clone(), true, false));
+        i += 1;
+    }
+    while j < m {
+        result.push((b[j].clone(), false, true));
+        j += 1;
+    }
+    result
+}
+
+// add helper function near end after compute_diff
+fn compute_diff_counts(orig:&str, edit:&str)->(usize,usize){
+    let segs=compute_diff(orig,edit);
+    let mut add=0;let mut del=0;
+    for (s,d,a) in segs{if a{add+=s.chars().count();} if d{del+=s.chars().count();}}
+    (add,del)
 } 

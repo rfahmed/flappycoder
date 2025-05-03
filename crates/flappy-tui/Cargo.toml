@@ -1,0 +1,18 @@
+[package]
+name = "flappy-tui"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+openai = ["flappy-llm/openai"]
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+tokio = { workspace = true }
+flappy-core = { path = "../flappy-core" }
+futures-util = { workspace = true }
+flappy-llm = { path = "../flappy-llm", optional = true } 
