@@ -122,101 +122,135 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                             Role::User => "You: ",
                             Role::Assistant => "AI: ",
                         };
-
                         if app.editing && app.selected_message_index == Some(index) {
-                            // We're editing this message - show the edit buffer with cursor
-                            let mut spans = Vec::new();
-                            spans.push(Span::styled(prefix, Style::default().fg(Color::Yellow)));
+                            // ## EDITING a REGULAR message ##
+                            let diff_segments = compute_diff(msg, &app.edit_buffer); // Diff against current msg
+                            let target_buffer_cursor = app.edit_cursor;
+                            let mut current_buffer_pos = 0;
+                            let mut cursor_inserted = false;
+                            let mut rendered_spans = Vec::new();
+                            for (segment, is_deletion, is_addition) in diff_segments {
+                                let current_segment_len = segment.chars().count();
+                                let style = match (is_deletion, is_addition) {
+                                    (true, false) => Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                                    (false, true) => Style::default().fg(Color::Green),
+                                    _ => Style::default(),
+                                };
 
-                            // Only compute diff for non-empty content
-                            if !app.edit_buffer.is_empty() || !app.original_text.is_empty() {
-                                // Compute visual diff between original and edited text
-                                let diff_segments = compute_diff(&app.original_text, &app.edit_buffer);
-                                
-                                // Count additions and deletions for badge
-                                let mut add_cnt = 0;
-                                let mut del_cnt = 0;
-                                for (seg, is_del, is_add) in &diff_segments {
-                                    if *is_add { add_cnt += seg.chars().count(); }
-                                    if *is_del { del_cnt += seg.chars().count(); }
-                                }
-                                // Build badge spans
-                                let mut badge_spans = Vec::new();
-                                if add_cnt > 0 {
-                                    badge_spans.push(Span::styled(format!("+{}", add_cnt), Style::default().fg(Color::Green)));
-                                    badge_spans.push(Span::raw(" "));
-                                }
-                                if del_cnt > 0 {
-                                    badge_spans.push(Span::styled(format!("-{}", del_cnt), Style::default().fg(Color::Red)));
-                                    badge_spans.push(Span::raw(" "));
-                                }
-                                spans.extend(badge_spans);
-                                
-                                let mut cursor_shown = false;
-                                let mut current_pos = prefix.len();
+                                if is_deletion {
+                                    rendered_spans.push(Span::styled(segment.clone(), style));
+                                } else {
+                                    let segment_start_buffer_pos = current_buffer_pos;
+                                    let segment_end_buffer_pos = current_buffer_pos + current_segment_len;
 
-                                for (segment, is_deletion, is_addition) in diff_segments {
-                                    let style = match (is_deletion, is_addition) {
-                                        (true, false) => Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
-                                        (false, true) => Style::default().fg(Color::Green),
-                                        _ => Style::default(),
-                                    };
-
-                                    // Add cursor in the right place if editing
-                                    if !cursor_shown && current_pos + segment.len() >= app.edit_cursor + prefix.len() {
-                                        // Figure out cursor position within this segment
-                                        let cursor_offset = app.edit_cursor + prefix.len() - current_pos;
+                                    if !cursor_inserted && target_buffer_cursor >= segment_start_buffer_pos && target_buffer_cursor < segment_end_buffer_pos {
+                                        let cursor_offset_in_segment = target_buffer_cursor - segment_start_buffer_pos;
+                                        let (before_cursor, at_cursor_and_after) = segment.split_at(cursor_offset_in_segment);
                                         
-                                        // Split the segment at cursor position and add cursor style
-                                        if cursor_offset < segment.len() {
-                                            let (before, after) = segment.split_at(cursor_offset);
-                                            spans.push(Span::styled(before.to_string(), style));
-                                            
-                                            // Add cursor - render as inverted character or a visible symbol
-                                            let cursor_char = after.chars().next().unwrap_or(' ');
-                                            spans.push(Span::styled(
-                                                cursor_char.to_string(),
-                                                Style::default().fg(Color::Black).bg(Color::Green)
-                                            ));
-                                            
-                                            // Rest of segment after cursor
-                                            if after.len() > 1 {
-                                                spans.push(Span::styled(after[1..].to_string(), style));
-                                            }
-                                            
-                                            cursor_shown = true;
-                                        } else {
-                                            spans.push(Span::styled(segment.clone(), style));
+                                        if !before_cursor.is_empty() { rendered_spans.push(Span::styled(before_cursor.to_string(), style)); }
+                                        
+                                        let cursor_char = at_cursor_and_after.chars().next().unwrap_or(' ');
+                                        rendered_spans.push(Span::styled(cursor_char.to_string(), Style::default().fg(Color::Black).bg(Color::Green)));
+                                        
+                                        if at_cursor_and_after.chars().count() > 1 {
+                                            let after_cursor = at_cursor_and_after.chars().skip(1).collect::<String>();
+                                            rendered_spans.push(Span::styled(after_cursor, style));
                                         }
+                                        cursor_inserted = true;
                                     } else {
-                                        spans.push(Span::styled(segment.clone(), style));
+                                        rendered_spans.push(Span::styled(segment.clone(), style));
                                     }
-                                    
-                                    current_pos += segment.len();
+                                    current_buffer_pos = segment_end_buffer_pos;
                                 }
-                                
-                                // If cursor is at the end of text, add it as a visible character
-                                if !cursor_shown {
-                                    spans.push(Span::styled("█", Style::default()));
-                                }
-                            } else {
-                                // Empty content, just show a cursor
-                                spans.push(Span::styled("█", Style::default()));
                             }
-                            
-                            vec![Line::from(spans)]
-                        } else if is_selected {
-                            // Selected message but not being edited - show with highlight
-                            vec![Line::from(vec![Span::styled(
-                                format!("{}{}", prefix, msg),
-                                line_style,
-                            )])]
+
+                            if !cursor_inserted && target_buffer_cursor == current_buffer_pos {
+                                rendered_spans.push(Span::styled(" ", Style::default().bg(Color::Green)));
+                                cursor_inserted = true;
+                            }
+
+                            let mut final_spans = vec![Span::styled(prefix, Style::default().fg(Color::Yellow))];
+                            final_spans.extend(rendered_spans);
+                            vec![Line::from(final_spans)]
                         } else {
-                            // Regular message display
-                            vec![Line::from(vec![
-                                Span::styled(prefix, Style::default().fg(Color::Yellow)),
-                                Span::raw(msg),
-                            ])]
+                            // ## NOT EDITING a REGULAR message ##
+                            let mut spans: Vec<Span> = Vec::new();
+                            let base_style = if is_selected { line_style } else { Style::default() };
+                            spans.push(Span::styled(prefix, base_style.fg(Color::Yellow)));
+                            spans.push(Span::styled(msg.clone(), base_style));
+                            vec![Line::from(spans)]
+                        }
+                    },
+                    ChatLogItem::EditedMessage(role, msg, add_cnt, del_cnt) => {
+                let prefix = match role {
+                    Role::User => "You: ",
+                    Role::Assistant => "AI: ",
+                };
+                        if app.editing && app.selected_message_index == Some(index) {
+                            // ## EDITING an EDITED message ##
+                            let diff_segments = compute_diff(&app.original_text, &app.edit_buffer); // Diff against STORED original
+                            let target_buffer_cursor = app.edit_cursor;
+                            let mut current_buffer_pos = 0;
+                            let mut cursor_inserted = false;
+                            let mut rendered_spans = Vec::new();
+                            for (segment, is_deletion, is_addition) in diff_segments {
+                                let current_segment_len = segment.chars().count();
+                                let style = match (is_deletion, is_addition) {
+                                    (true, false) => Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                                    (false, true) => Style::default().fg(Color::Green),
+                                    _ => Style::default(),
+                                };
+
+                                if is_deletion {
+                                    rendered_spans.push(Span::styled(segment.clone(), style));
+                                } else {
+                                    let segment_start_buffer_pos = current_buffer_pos;
+                                    let segment_end_buffer_pos = current_buffer_pos + current_segment_len;
+
+                                    if !cursor_inserted && target_buffer_cursor >= segment_start_buffer_pos && target_buffer_cursor < segment_end_buffer_pos {
+                                        let cursor_offset_in_segment = target_buffer_cursor - segment_start_buffer_pos;
+                                        let (before_cursor, at_cursor_and_after) = segment.split_at(cursor_offset_in_segment);
+                                        
+                                        if !before_cursor.is_empty() { rendered_spans.push(Span::styled(before_cursor.to_string(), style)); }
+                                        
+                                        let cursor_char = at_cursor_and_after.chars().next().unwrap_or(' ');
+                                        rendered_spans.push(Span::styled(cursor_char.to_string(), Style::default().fg(Color::Black).bg(Color::Green)));
+                                        
+                                        if at_cursor_and_after.chars().count() > 1 {
+                                            let after_cursor = at_cursor_and_after.chars().skip(1).collect::<String>();
+                                            rendered_spans.push(Span::styled(after_cursor, style));
+                                        }
+                                        cursor_inserted = true;
+                                    } else {
+                                        rendered_spans.push(Span::styled(segment.clone(), style));
+                                    }
+                                    current_buffer_pos = segment_end_buffer_pos;
+                                }
+                            }
+
+                            if !cursor_inserted && target_buffer_cursor == current_buffer_pos {
+                                rendered_spans.push(Span::styled(" ", Style::default().bg(Color::Green)));
+                                cursor_inserted = true;
+                            }
+
+                            let mut final_spans = vec![Span::styled(prefix, Style::default().fg(Color::Yellow))];
+                            // Add badge WHEN editing an already edited message
+                            if *add_cnt > 0 { final_spans.push(Span::styled(format!(" +{}", add_cnt), Style::default().fg(Color::Green))); }
+                            if *del_cnt > 0 { final_spans.push(Span::styled(format!(" -{}", del_cnt), Style::default().fg(Color::Red))); }
+                            if *add_cnt > 0 || *del_cnt > 0 { final_spans.push(Span::raw(" ")); }
+                            final_spans.extend(rendered_spans);
+                            vec![Line::from(final_spans)]
+                        } else {
+                            // ## NOT EDITING an EDITED message ##
+                            let mut spans: Vec<Span> = Vec::new();
+                            let base_style = if is_selected { line_style } else { Style::default() };
+                            spans.push(Span::styled(prefix, base_style.fg(Color::Yellow)));
+                            // Add badge
+                            if *add_cnt > 0 { spans.push(Span::styled(format!(" +{}", add_cnt), base_style.fg(Color::Green))); }
+                            if *del_cnt > 0 { spans.push(Span::styled(format!(" -{}", del_cnt), base_style.fg(Color::Red))); }
+                            if *add_cnt > 0 || *del_cnt > 0 { spans.push(Span::raw(" ")); }
+                            spans.push(Span::styled(msg.clone(), base_style));
+                            vec![Line::from(spans)]
                         }
                     },
                     ChatLogItem::ModelSwitch(model_name) => {
@@ -260,23 +294,6 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                             ]
                         }
                     },
-                    ChatLogItem::EditedMessage(role, msg, add_cnt, del_cnt) => {
-                        let prefix = match role {
-                            Role::User => "You: ",
-                            Role::Assistant => "AI: ",
-                        };
-                        let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::Yellow))];
-                        if *add_cnt > 0 {
-                            spans.push(Span::styled(format!("+{}", add_cnt), Style::default().fg(Color::Green)));
-                            spans.push(Span::raw(" "));
-                        }
-                        if *del_cnt > 0 {
-                            spans.push(Span::styled(format!("-{}", del_cnt), Style::default().fg(Color::Red)));
-                            spans.push(Span::raw(" "));
-                        }
-                        spans.push(Span::raw(msg));
-                        vec![Line::from(spans)]
-                    }
                 }
             }).flatten() // Flatten the Vec<Vec<Line>> into Vec<Line>
               .collect();

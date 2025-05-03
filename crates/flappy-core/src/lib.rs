@@ -106,15 +106,18 @@ impl App {
     // Start editing the selected message
     pub fn start_editing(&mut self) -> bool {
         if let Some(idx) = self.selected_message_index {
-            if let ChatLogItem::Message(_, content) = &self.messages[idx] {
-                if self.original_index != Some(idx) {
-                    self.original_index = Some(idx);
-                    self.original_text = content.clone();
+            match &self.messages[idx] {
+                ChatLogItem::Message(_, content) | ChatLogItem::EditedMessage(_, content, _, _) => {
+                    if self.original_index != Some(idx) {
+                        self.original_index = Some(idx);
+                        self.original_text = content.clone();
+                    }
+                    self.editing = true;
+                    self.edit_buffer = content.clone();
+                    self.edit_cursor = self.edit_buffer.len();
+                    return true;
                 }
-                self.editing = true;
-                self.edit_buffer = content.clone();
-                self.edit_cursor = self.edit_buffer.len(); // Place cursor at end
-                return true;
+                _ => {}
             }
         }
         false // Can't edit if no message selected or not a Message type
@@ -124,10 +127,13 @@ impl App {
     pub fn commit_edit(&mut self) {
         if self.editing {
             if let Some(idx) = self.selected_message_index {
-                if let ChatLogItem::Message(role, _) = &self.messages[idx] {
-                    let role_clone = *role;
-                    let (add, del) = compute_diff_counts(&self.original_text, &self.edit_buffer);
-                    self.messages[idx] = ChatLogItem::EditedMessage(role_clone, self.edit_buffer.clone(), add, del);
+                match &self.messages[idx] {
+                    ChatLogItem::Message(role, _) | ChatLogItem::EditedMessage(role, _, _, _) => {
+                        let role_clone = *role;
+                        let (add, del) = compute_diff_counts(&self.original_text, &self.edit_buffer);
+                        self.messages[idx] = ChatLogItem::EditedMessage(role_clone, self.edit_buffer.clone(), add, del);
+                    }
+                    _ => {}
                 }
             }
             self.cancel_edit(); // Reset edit state
@@ -139,6 +145,11 @@ impl App {
         self.editing = false;
         self.edit_buffer.clear();
         self.edit_cursor = 0;
+        // Preserve original_index and original_text so that edits are always compared
+        // against the very first version of the message (baseline). This allows
+        // subsequent re-edits – including "empty" edits where the user makes no
+        // changes – to continue diffing against the true original content and
+        // therefore keep the +/- badge visible.
     }
 
     // Insert a character at the cursor position
