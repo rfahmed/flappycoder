@@ -182,22 +182,117 @@ async fn ui_loop<B: ratatui::backend::Backend>(
             }
         })?;
 
-        // Event handling will be added in the next commit...
-        
-        // Simple temporary event handling to allow quitting
         if crossterm::event::poll(tick_rate)? {
             if let CEvent::Key(key) = event::read()? {
-                 match key.code {
-                      KeyCode::Esc => {
-                          if quit_pending {
-                              return Ok(()); // Quit
-                          } else {
-                              quit_pending = true;
-                              quit_message_timer = Some(std::time::Instant::now());
-                          }
-                      }
-                      _ => { quit_pending = false; } // Any other key cancels quit prompt
-                 }
+                let old_focus = app.focus; // Track focus changes
+
+                match (app.focus, key.code, key.modifiers) {
+                    // --- Global Quit --- 
+                    (_, KeyCode::Esc, _) => {
+                        if quit_pending {
+                            return Ok(()); // Quit
+                        } else {
+                            quit_pending = true;
+                            quit_message_timer = Some(std::time::Instant::now());
+                        }
+                    }
+                    // --- Tab/Shift-Tab Focus Cycling --- 
+                    (_, KeyCode::Tab, KeyModifiers::NONE) => {
+                        app.focus = match app.focus {
+                            Focus::Chat => Focus::Model,
+                            Focus::Model => Focus::Input,
+                            Focus::Input => Focus::Chat,
+                        };
+                        quit_pending = false;
+                    }
+                    (_, KeyCode::BackTab, KeyModifiers::SHIFT) => {
+                        app.focus = match app.focus {
+                            Focus::Chat => Focus::Input,
+                            Focus::Model => Focus::Chat,
+                            Focus::Input => Focus::Model,
+                        };
+                        quit_pending = false;
+                    }
+                    // --- Chat Pane --- 
+                    (Focus::Chat, KeyCode::Up | KeyCode::Char('k'), _) => {
+                        app.chat_scroll = app.chat_scroll.saturating_sub(if key.modifiers == KeyModifiers::SHIFT { 5 } else { 1 });
+                        quit_pending = false;
+                    }
+                    (Focus::Chat, KeyCode::Down | KeyCode::Char('j'), _) => {
+                        let max_scroll = app.messages.len().saturating_sub(1) as u16; // Adjust based on visible lines
+                        app.chat_scroll = app.chat_scroll.saturating_add(if key.modifiers == KeyModifiers::SHIFT { 5 } else { 1 }).min(max_scroll);
+                        quit_pending = false;
+                    }
+                    // --- Model Selector Pane --- 
+                    (Focus::Model, KeyCode::Up | KeyCode::Char('k'), modifier) => {
+                        let fast = if modifier == KeyModifiers::SHIFT { 5 } else { 1 };
+                        if menu_selected > 0 {
+                           menu_selected = menu_selected.saturating_sub(fast);
+                        }
+                        quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::Down | KeyCode::Char('j'), modifier) => {
+                        let fast = if modifier == KeyModifiers::SHIFT { 5 } else { 1 };
+                        if menu_selected + 1 < models.len() {
+                            menu_selected = (menu_selected + fast).min(models.len() - 1);
+                        }
+                        quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::PageUp, _) => {
+                       let page_size = model_area.height.saturating_sub(4) as usize;
+                       menu_selected = menu_selected.saturating_sub(page_size);
+                       quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::PageDown, _) => {
+                       let page_size = model_area.height.saturating_sub(4) as usize;
+                       menu_selected = (menu_selected + page_size).min(models.len() - 1);
+                       quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::Home, _) => { 
+                       menu_selected = 0; 
+                       quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::End, _) => { 
+                       menu_selected = models.len().saturating_sub(1); 
+                       quit_pending = false;
+                    }
+                    (Focus::Model, KeyCode::Enter, _) => {
+                        app.model = models[menu_selected].clone();
+                        app.selector_open = false; // Close selector on selection
+                        app.focus = Focus::Input;  // Move focus to input after selection
+                        quit_pending = false;
+                    }
+                    // --- Input Pane --- 
+                    (Focus::Input, KeyCode::Char(c), _) => {
+                        input_buf.push(c);
+                        quit_pending = false;
+                    }
+                    (Focus::Input, KeyCode::Backspace, _) => {
+                        input_buf.pop();
+                        quit_pending = false;
+                    }
+                    (Focus::Input, KeyCode::Enter, _) => {
+                        if !input_buf.trim().is_empty() {
+                            let msg = input_buf.clone();
+                            input_buf.clear();
+                            app.messages.push((Role::User, msg.clone()));
+                            let mut app_clone = app.clone();
+                            tokio::spawn(async move {
+                                let _ = app_clone.handle_user_msg(msg).await;
+                            });
+                        }
+                        quit_pending = false;
+                    }
+                    // --- Catch-all for other keys --- 
+                    _ => { quit_pending = false; } // Any other key cancels quit prompt
+                }
+
+                // Toggle selector pane visibility based on focus change
+                if old_focus != Focus::Model && app.focus == Focus::Model {
+                    app.selector_open = true;
+                } else if old_focus == Focus::Model && app.focus != Focus::Model {
+                    app.selector_open = false;
+                }
             }
         }
 
