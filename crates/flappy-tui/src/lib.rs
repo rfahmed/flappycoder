@@ -454,8 +454,23 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                         app.focus = Focus::Input; // Go back to input field
                         quit_pending = false; // Ensure quit is not triggered
                     }
-                    // Edit mode - Cancel editing
+                    // Edit mode - ESC: cancel edit or Option+Arrow sequences (Meta sends ESC b/f)
                     (Focus::Chat, KeyCode::Esc, _) if app.editing => {
+                        // Peek for next key event to catch Option+Left (b) / Option+Right (f)
+                        if crossterm::event::poll(Duration::from_millis(50))? {
+                            if let CEvent::Key(key2) = event::read()? {
+                                match key2.code {
+                                    KeyCode::Char('b') => {
+                                        app.word_left(); quit_pending = false; continue;
+                                    }
+                                    KeyCode::Char('f') => {
+                                        app.word_right(); quit_pending = false; continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Otherwise cancel editing
                         app.cancel_edit();
                         quit_pending = false;
                     }
@@ -537,26 +552,29 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                         app.commit_edit();
                         quit_pending = false;
                     }
-                    // Edit mode - Character input
-                    (Focus::Chat, KeyCode::Char(c), _) if app.editing => {
-                        app.insert_char(c);
-                        quit_pending = false;
-                    }
-                    // Edit mode - Backspace
-                    (Focus::Chat, KeyCode::Backspace, _) if app.editing => {
-                        app.delete_char();
-                        quit_pending = false;
-                    }
-                    // Edit mode - Left arrow
-                    (Focus::Chat, KeyCode::Left, _) if app.editing => {
-                        app.cursor_left();
-                        quit_pending = false;
-                    }
-                    // Edit mode - Right arrow
-                    (Focus::Chat, KeyCode::Right, _) if app.editing => {
-                        app.cursor_right();
-                        quit_pending = false;
-                    }
+                    // Edit mode - Word skip via ALT+Char (Option+Left/Right fallback) meta-b / meta-f
+                    (Focus::Chat, KeyCode::Char('b'), KeyModifiers::ALT) if app.editing => { app.word_left(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Char('b'), KeyModifiers::NONE) if app.editing => { app.word_left(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Char('f'), KeyModifiers::ALT) if app.editing => { app.word_right(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Char('f'), KeyModifiers::NONE) if app.editing => { app.word_right(); quit_pending = false; }
+                    // Edit mode - Fallback for macOS Option+Left/Right (sends 'b'/'f')
+                    (Focus::Chat, KeyCode::Char('b'), KeyModifiers::NONE) if app.editing => { app.word_left(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Char('f'), KeyModifiers::NONE) if app.editing => { app.word_right(); quit_pending = false; }
+                    // Edit mode - Word skip (Option/Alt + arrows)
+                    (Focus::Chat, KeyCode::Left, modifier) if app.editing && modifier.contains(KeyModifiers::ALT) => { app.word_left(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Right, modifier) if app.editing && modifier.contains(KeyModifiers::ALT) => { app.word_right(); quit_pending = false; }
+                    // Edit mode - Jump to start/end (Ctrl+A/E)
+                    (Focus::Chat, KeyCode::Char('a'), KeyModifiers::CONTROL) if app.editing => { app.cursor_to_start(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Char('e'), KeyModifiers::CONTROL) if app.editing => { app.cursor_to_end(); quit_pending = false; }
+                    // Edit mode - Jump to start/end (Command/Super + arrows)
+                    (Focus::Chat, KeyCode::Left, modifier) if app.editing && modifier.contains(KeyModifiers::SUPER) => { app.cursor_to_start(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Right, modifier) if app.editing && modifier.contains(KeyModifiers::SUPER) => { app.cursor_to_end(); quit_pending = false; }
+                    // Edit mode - Move cursor one character
+                    (Focus::Chat, KeyCode::Left, _) if app.editing => { app.cursor_left(); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Right, _) if app.editing => { app.cursor_right(); quit_pending = false; }
+                    // Edit mode - Insert and delete characters
+                    (Focus::Chat, KeyCode::Char(c), KeyModifiers::NONE) if app.editing => { app.insert_char(c); quit_pending = false; }
+                    (Focus::Chat, KeyCode::Backspace, _) if app.editing => { app.delete_char(); quit_pending = false; }
                     // --- Model Selector Pane --- 
                     (Focus::Model, KeyCode::Up | KeyCode::Char('k'), modifier) => {
                         let fast = if modifier == KeyModifiers::SHIFT { 5 } else { 1 };
@@ -580,14 +598,6 @@ async fn ui_loop<B: ratatui::backend::Backend>(
                     (Focus::Model, KeyCode::PageDown, _) => {
                         let page_size = last_model_area_height.saturating_sub(4) as usize; // Use height from last draw
                         menu_selected = (menu_selected + page_size).min(models.len() - 1);
-                        quit_pending = false;
-                    }
-                    (Focus::Model, KeyCode::Home, _) => { 
-                       menu_selected = 0; 
-                       quit_pending = false;
-                    }
-                    (Focus::Model, KeyCode::End, _) => { 
-                       menu_selected = models.len().saturating_sub(1); 
                        quit_pending = false;
                     }
                     (Focus::Model, KeyCode::Enter, _) => {

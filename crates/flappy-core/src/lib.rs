@@ -70,7 +70,6 @@ impl App {
     }
 
     pub async fn handle_user_msg(&mut self, txt: String) -> Result<()> {
-        self.messages.push(ChatLogItem::Message(Role::User, txt.clone()));
         // Convert history to plain tuples to avoid flappy-llm depending on ChatLogItem
         let history: Vec<(String, String)> = self
             .messages
@@ -81,7 +80,7 @@ impl App {
             .skip(1)
             .rev()
             .filter_map(|item| match item {
-                ChatLogItem::Message(role, content) => {
+                ChatLogItem::Message(role, content) | ChatLogItem::EditedMessage(role, content, _, _) => {
                     let role_str = match role {
                         Role::User => "user".to_string(),
                         Role::Assistant => "assistant".to_string(),
@@ -114,7 +113,7 @@ impl App {
                     }
                     self.editing = true;
                     self.edit_buffer = content.clone();
-                    self.edit_cursor = self.edit_buffer.len();
+                    self.edit_cursor = 0;
                     return true;
                 }
                 _ => {}
@@ -179,6 +178,55 @@ impl App {
     pub fn cursor_right(&mut self) {
         if self.editing && self.edit_cursor < self.edit_buffer.len() {
             self.edit_cursor += 1;
+        }
+    }
+
+    // Skip cursor left by word (Option+Left)
+    pub fn word_left(&mut self) {
+        if self.editing && self.edit_cursor > 0 {
+            let buf = self.edit_buffer.as_bytes();
+            let mut idx = self.edit_cursor;
+            // skip any whitespace to the left
+            while idx > 0 && buf[idx - 1].is_ascii_whitespace() {
+                idx -= 1;
+            }
+            // skip non-whitespace to the left
+            while idx > 0 && !buf[idx - 1].is_ascii_whitespace() {
+                idx -= 1;
+            }
+            self.edit_cursor = idx;
+        }
+    }
+
+    // Skip cursor right by word (Option+Right)
+    pub fn word_right(&mut self) {
+        if self.editing && self.edit_cursor < self.edit_buffer.len() {
+            let buf = self.edit_buffer.as_bytes();
+            let len = buf.len();
+            let mut idx = self.edit_cursor;
+            // skip any whitespace to the right
+            while idx < len && buf[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            // skip non-whitespace to the right
+            while idx < len && !buf[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            self.edit_cursor = idx;
+        }
+    }
+
+    // Jump to start of buffer (Ctrl+Left)
+    pub fn cursor_to_start(&mut self) {
+        if self.editing {
+            self.edit_cursor = 0;
+        }
+    }
+
+    // Jump to end of buffer (Ctrl+Right)
+    pub fn cursor_to_end(&mut self) {
+        if self.editing {
+            self.edit_cursor = self.edit_buffer.len();
         }
     }
 }
